@@ -26,6 +26,14 @@ using namespace mlir::triton;
 
 namespace {
 
+// Helper to avoid deprecated OpBuilder::create
+template <typename OpTy, typename... Args>
+OpTy createOp(OpBuilder &builder, Location loc, Args &&...args) {
+    auto op = OpTy::create(builder, loc, std::forward<Args>(args)...);
+    // OpTy::create already inserts the operation using the builder.
+    return op;
+}
+
 class TritonToRVVTypeConverter : public TypeConverter {
 public:
   TritonToRVVTypeConverter() {
@@ -97,6 +105,15 @@ struct SplatOpConversion : public OpConversionPattern<triton::SplatOp> {
                                 ConversionPatternRewriter &rewriter) const override {
     auto resultType = typeConverter->convertType(op.getType());
     if (!resultType) return failure();
+    
+    if (isa<MemRefType>(adaptor.getSrc().getType())) {
+        auto vecType = cast<VectorType>(resultType);
+        auto zeroAttr = rewriter.getIntegerAttr(vecType.getElementType(), 0);
+        auto zero = createOp<arith::ConstantOp>(rewriter, op.getLoc(), zeroAttr);
+        rewriter.replaceOpWithNewOp<vector::BroadcastOp>(op, resultType, zero);
+        return success();
+    }
+ 
     rewriter.replaceOpWithNewOp<vector::BroadcastOp>(op, resultType, adaptor.getSrc());
     return success();
   }
@@ -117,6 +134,150 @@ struct ArithConstantOpConversion : public OpConversionPattern<arith::ConstantOp>
       return success();
     }
     return failure();
+  }
+};
+
+struct MakeRangeOpConversion : public OpConversionPattern<triton::MakeRangeOp> {
+  using OpConversionPattern<triton::MakeRangeOp>::OpConversionPattern;
+
+  LogicalResult matchAndRewrite(triton::MakeRangeOp op, OpAdaptor adaptor,
+                                ConversionPatternRewriter &rewriter) const override {
+    int32_t start = op.getStart();
+    int32_t end = op.getEnd();
+    auto resultType = typeConverter->convertType(op.getType());
+    auto vectorType = dyn_cast<VectorType>(resultType);
+    if (!vectorType) return failure();
+
+    SmallVector<Attribute> values;
+    for (int32_t i = start; i < end; ++i) {
+      values.push_back(rewriter.getI32IntegerAttr(i));
+    }
+    
+    auto attr = DenseElementsAttr::get(vectorType, values);
+    rewriter.replaceOpWithNewOp<arith::ConstantOp>(op, vectorType, attr);
+    return success();
+  }
+};
+
+struct AddPtrOpConversion : public OpConversionPattern<triton::AddPtrOp> {
+  using OpConversionPattern<triton::AddPtrOp>::OpConversionPattern;
+
+  LogicalResult matchAndRewrite(triton::AddPtrOp op, OpAdaptor adaptor,
+                                ConversionPatternRewriter &rewriter) const override {
+    if (isa<MemRefType>(adaptor.getPtr().getType())) {
+        return failure();
+    }
+    Value ptr = adaptor.getPtr();
+    Value offset = adaptor.getOffset();
+    
+    auto ptrType = cast<VectorType>(ptr.getType());
+    auto offsetType = cast<VectorType>(offset.getType());
+    
+    if (ptrType.getElementType() != offsetType.getElementType()) {
+        // Sign extend offset to match pointer width
+        if (ptrType.getElementType().getIntOrFloatBitWidth() > offsetType.getElementType().getIntOrFloatBitWidth()) {
+             offset = createOp<arith::ExtSIOp>(rewriter, op.getLoc(), ptrType, offset);
+        }
+    }
+
+    rewriter.replaceOpWithNewOp<arith::AddIOp>(op, ptr, offset);
+    return success();
+  }
+};
+
+struct LoadOpConversion : public OpConversionPattern<triton::LoadOp> {
+  using OpConversionPattern<triton::LoadOp>::OpConversionPattern;
+
+  LogicalResult matchAndRewrite(triton::LoadOp op, OpAdaptor adaptor,
+                                ConversionPatternRewriter &rewriter) const override {
+    Value ptr = op.getPtr();
+    Value base;
+    Value offset;
+    
+    auto addPtrOp = ptr.getDefiningOp<triton::AddPtrOp>();
+    if (addPtrOp) {
+        auto splatOp = addPtrOp.getPtr().getDefiningOp<triton::SplatOp>();
+        if (splatOp) {
+            base = rewriter.getRemappedValue(splatOp.getSrc());
+            offset = rewriter.getRemappedValue(addPtrOp.getOffset());
+        }
+    }
+    
+    if (!base || !offset || !isa<MemRefType>(base.getType())) {
+        return failure();
+    }
+    
+    auto loc = op.getLoc();
+    auto resultType = typeConverter->convertType(op.getType());
+    auto vecType = cast<VectorType>(resultType);
+    auto elemType = vecType.getElementType();
+    
+    SmallVector<int64_t> pos = {0};
+    Value startOffset = createOp<vector::ExtractOp>(rewriter, loc, offset, pos);
+    
+    if (!isa<IndexType>(startOffset.getType())) {
+        startOffset = createOp<arith::IndexCastOp>(rewriter, loc, rewriter.getIndexType(), startOffset);
+    }
+    
+    Value padding;
+    if (isa<FloatType>(elemType)) {
+        padding = createOp<arith::ConstantOp>(rewriter, loc, rewriter.getFloatAttr(elemType, 0.0));
+    } else {
+        padding = createOp<arith::ConstantOp>(rewriter, loc, rewriter.getIntegerAttr(elemType, 0));
+    }
+    
+    SmallVector<Value> indices = {startOffset};
+    SmallVector<bool> inBounds(vecType.getRank(), true);
+    auto inBoundsAttr = rewriter.getBoolArrayAttr(inBounds);
+    auto map = AffineMap::getMultiDimIdentityMap(vecType.getRank(), rewriter.getContext());
+    
+    rewriter.replaceOpWithNewOp<vector::TransferReadOp>(
+        op, resultType, base, indices, AffineMapAttr::get(map), padding, /*mask=*/Value(), inBoundsAttr);
+        
+    return success();
+  }
+};
+
+struct StoreOpConversion : public OpConversionPattern<triton::StoreOp> {
+  using OpConversionPattern<triton::StoreOp>::OpConversionPattern;
+
+  LogicalResult matchAndRewrite(triton::StoreOp op, OpAdaptor adaptor,
+                                ConversionPatternRewriter &rewriter) const override {
+    Value ptr = op.getPtr();
+    Value base;
+    Value offset;
+    
+    auto addPtrOp = ptr.getDefiningOp<triton::AddPtrOp>();
+    if (addPtrOp) {
+        auto splatOp = addPtrOp.getPtr().getDefiningOp<triton::SplatOp>();
+        if (splatOp) {
+            base = rewriter.getRemappedValue(splatOp.getSrc());
+            offset = rewriter.getRemappedValue(addPtrOp.getOffset());
+        }
+    }
+    
+    if (!base || !offset || !isa<MemRefType>(base.getType())) {
+        return failure();
+    }
+    
+    auto loc = op.getLoc();
+    SmallVector<int64_t> pos = {0};
+    Value startOffset = createOp<vector::ExtractOp>(rewriter, loc, offset, pos);
+    
+    if (!isa<IndexType>(startOffset.getType())) {
+        startOffset = createOp<arith::IndexCastOp>(rewriter, loc, rewriter.getIndexType(), startOffset);
+    }
+    
+    SmallVector<Value> indices = {startOffset};
+    auto vecType = cast<VectorType>(adaptor.getValue().getType());
+    SmallVector<bool> inBounds(vecType.getRank(), true);
+    auto inBoundsAttr = rewriter.getBoolArrayAttr(inBounds);
+    auto map = AffineMap::getMultiDimIdentityMap(vecType.getRank(), rewriter.getContext());
+    
+    rewriter.replaceOpWithNewOp<vector::TransferWriteOp>(
+        op, adaptor.getValue(), base, indices, AffineMapAttr::get(map), /*mask=*/Value(), inBoundsAttr);
+        
+    return success();
   }
 };
 
@@ -160,6 +321,10 @@ public:
     patterns.add<ReturnOpConversion>(typeConverter, &getContext());
     patterns.add<SplatOpConversion>(typeConverter, &getContext());
     patterns.add<ArithConstantOpConversion>(typeConverter, &getContext());
+    patterns.add<MakeRangeOpConversion>(typeConverter, &getContext());
+    patterns.add<AddPtrOpConversion>(typeConverter, &getContext());
+    patterns.add<LoadOpConversion>(typeConverter, &getContext());
+    patterns.add<StoreOpConversion>(typeConverter, &getContext());
     
     // Arithmetic ops
     patterns.add<ArithOpConversion<arith::AddFOp, arith::AddFOp>>(typeConverter, &getContext());
@@ -176,5 +341,4 @@ public:
     }
   }
 };
-
 } // namespace
