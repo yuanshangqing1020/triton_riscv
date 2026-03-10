@@ -73,8 +73,14 @@ struct FuncOpConversion : public OpConversionPattern<triton::FuncOp> {
     if (failed(typeConverter->convertTypes(funcType.getResults(), newResultTypes)))
       return failure();
 
-    auto newFuncType = FunctionType::get(rewriter.getContext(), signatureConversion.getConvertedTypes(),
-                                         newResultTypes);
+    // Add 3 i32 arguments for grid coordinates (pid_x, pid_y, pid_z)
+    SmallVector<Type> newInputTypes(signatureConversion.getConvertedTypes());
+    auto i32Ty = rewriter.getI32Type();
+    newInputTypes.push_back(i32Ty); // pid_x
+    newInputTypes.push_back(i32Ty); // pid_y
+    newInputTypes.push_back(i32Ty); // pid_z
+
+    auto newFuncType = FunctionType::get(rewriter.getContext(), newInputTypes, newResultTypes);
 
     auto newFuncOp = func::FuncOp::create(op.getLoc(), op.getName(), newFuncType);
     rewriter.insert(newFuncOp);
@@ -83,7 +89,37 @@ struct FuncOpConversion : public OpConversionPattern<triton::FuncOp> {
     if (failed(rewriter.convertRegionTypes(&newFuncOp.getBody(), *typeConverter, &signatureConversion)))
       return failure();
 
+    // Append the new arguments to the entry block
+    Block &entryBlock = newFuncOp.getBody().front();
+    entryBlock.addArgument(i32Ty, op.getLoc());
+    entryBlock.addArgument(i32Ty, op.getLoc());
+    entryBlock.addArgument(i32Ty, op.getLoc());
+
     rewriter.eraseOp(op);
+    return success();
+  }
+};
+
+struct GetProgramIdOpConversion : public OpConversionPattern<triton::GetProgramIdOp> {
+  using OpConversionPattern<triton::GetProgramIdOp>::OpConversionPattern;
+
+  LogicalResult matchAndRewrite(triton::GetProgramIdOp op, OpAdaptor adaptor,
+                                ConversionPatternRewriter &rewriter) const override {
+    auto funcOp = op->getParentOfType<func::FuncOp>();
+    if (!funcOp) return failure();
+    
+    int32_t axis = op.getAxisAsInt();
+    if (axis < 0 || axis > 2) return failure();
+    
+    unsigned numArgs = funcOp.getNumArguments();
+    // We expect at least 3 arguments (pid_x, pid_y, pid_z) at the end
+    if (numArgs < 3) return failure(); 
+    
+    // The pids are the last 3 arguments
+    // pid_x is at index -3, pid_y at -2, pid_z at -1
+    Value pid = funcOp.getArgument(numArgs - 3 + axis);
+    
+    rewriter.replaceOp(op, pid);
     return success();
   }
 };
@@ -336,6 +372,7 @@ public:
     RewritePatternSet patterns(&getContext());
     // Pass &getContext() because OpConversionPattern expects MLIRContext*
     patterns.add<FuncOpConversion>(typeConverter, &getContext());
+    patterns.add<GetProgramIdOpConversion>(typeConverter, &getContext());
     patterns.add<ReturnOpConversion>(typeConverter, &getContext());
     patterns.add<SplatOpConversion>(typeConverter, &getContext());
     patterns.add<ArithConstantOpConversion>(typeConverter, &getContext());
