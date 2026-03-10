@@ -203,6 +203,15 @@ struct LoadOpConversion : public OpConversionPattern<triton::LoadOp> {
         }
     }
     
+    // If base is defined by a cast (memref -> ptr), peek through it
+    if (base) {
+        if (auto castOp = base.getDefiningOp<UnrealizedConversionCastOp>()) {
+             if (castOp.getInputs().size() == 1 && isa<MemRefType>(castOp.getInputs()[0].getType())) {
+                 base = castOp.getInputs()[0];
+             }
+        }
+    }
+
     if (!base || !offset || !isa<MemRefType>(base.getType())) {
         return failure();
     }
@@ -253,6 +262,15 @@ struct StoreOpConversion : public OpConversionPattern<triton::StoreOp> {
         if (splatOp) {
             base = rewriter.getRemappedValue(splatOp.getSrc());
             offset = rewriter.getRemappedValue(addPtrOp.getOffset());
+        }
+    }
+    
+    // If base is defined by a cast (memref -> ptr), peek through it
+    if (base) {
+        if (auto castOp = base.getDefiningOp<UnrealizedConversionCastOp>()) {
+             if (castOp.getInputs().size() == 1 && isa<MemRefType>(castOp.getInputs()[0].getType())) {
+                 base = castOp.getInputs()[0];
+             }
         }
     }
     
