@@ -21,6 +21,12 @@ module {
     %1 = tt.splat %arg0 : !tt.ptr<f32> -> tensor<4x!tt.ptr<f32>>
     %2 = tt.addptr %1, %offset : tensor<4x!tt.ptr<f32>>, tensor<4xi32>
     
+    %3 = tt.load %2 : tensor<4x!tt.ptr<f32>>
+    
+    %4 = tt.splat %arg1 : !tt.ptr<f32> -> tensor<4x!tt.ptr<f32>>
+    %5 = tt.addptr %4, %offset : tensor<4x!tt.ptr<f32>>, tensor<4xi32>
+    tt.store %5, %3 : tensor<4x!tt.ptr<f32>>
+
     tt.return
   }
 }
